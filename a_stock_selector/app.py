@@ -137,7 +137,9 @@ def main() -> None:
                     progress = progress_widgets(st, "批量刷新并运行")
                     skip_dates = reusable_trade_dates(conn)
                     dataset = TushareDataProvider(max_stocks=0, skip_trade_dates=skip_dates, progress_callback=progress).fetch()
+                    progress("准备写入 SQLite", 0, 100)
                     save_dataset_incremental(conn, dataset, progress_callback=progress)
+                    progress("数据写入完成，准备运行策略", 100, 100)
                     summary = run_strategy(conn, progress_callback=progress)
                     st.success(f"刷新+策略完成 · 候选 {summary.candidate_count} 只")
 

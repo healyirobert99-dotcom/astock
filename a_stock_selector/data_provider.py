@@ -667,6 +667,7 @@ class TushareDataProvider:
         if not indicator_frames and not income_frames:
             return pd.DataFrame([_empty_financial_row(code) for code in stock_basic["code"]])
 
+        self._emit("财务指标读取完成，正在整理财务字段", 98, 100)
         basic_codes = stock_basic[["ts_code", "code"]].copy()
         indicator = pd.concat(indicator_frames, ignore_index=True) if indicator_frames else pd.DataFrame(columns=["ts_code", "end_date"])
         income = pd.concat(income_frames, ignore_index=True) if income_frames else pd.DataFrame(columns=["ts_code", "end_date"])
@@ -702,6 +703,7 @@ class TushareDataProvider:
             }
         )
         financials["data_quality_note"] = financials.apply(_financial_quality_note, axis=1)
+        self._emit("补充财务摘要缺失字段", 99, 100)
         financials = _supplement_financials_with_akshare(financials, stock_basic)
         return financials
 
