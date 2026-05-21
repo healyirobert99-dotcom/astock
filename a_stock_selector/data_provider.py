@@ -1208,6 +1208,14 @@ def _infer_suspended_from_latest_bar(
     return _mark_suspended_codes(stock_basic, stock_daily, inferred, latest_trade_date)
 
 
+def _mark_suspended_by_latest_bar(
+    stock_basic: pd.DataFrame,
+    stock_daily: pd.DataFrame,
+    latest_trade_date: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    return _infer_suspended_from_latest_bar(stock_basic, stock_daily, latest_trade_date)
+
+
 def _empty_stock_daily_frame() -> pd.DataFrame:
     return pd.DataFrame(
         columns=[
