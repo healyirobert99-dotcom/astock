@@ -5,7 +5,7 @@ from html import escape
 import pandas as pd
 
 from .config import DEFAULT_DB_PATH, RISK_WARNING
-from .data_provider import SampleDataProvider, TushareDataProvider, save_dataset, save_dataset_incremental
+from .data_provider import AKShareDataProvider, SampleDataProvider, save_dataset, save_dataset_incremental
 from .db import connect, init_db, read_sql, table_count
 from .strategy import run_strategy
 
@@ -105,17 +105,15 @@ def main() -> None:
             st.markdown('<div class="sidebar-section-label">数据操作</div>', unsafe_allow_html=True)
 
             snapshot_for_action = current_snapshot(conn)
-            can_run_real_strategy = snapshot_for_action is not None and snapshot_for_action["data_source"] == "tushare"
+            can_run_real_strategy = snapshot_for_action is not None and snapshot_for_action["data_source"] != "sample"
 
-            if st.button("⭳ 刷新 Tushare 全市场", use_container_width=True, type="secondary",
-                         help="从Tushare拉取最新行情、财务和基础数据"):
+            if st.button("⭳ 刷新免费全市场", use_container_width=True, type="secondary",
+                         help="使用 AKShare / 腾讯 / 东方财富免费接口刷新行情；财务优先复用本地最近财报"):
                 try:
                     progress = progress_widgets(st, "刷新全市场数据")
-                    snapshot_for_refresh = current_snapshot(conn)
-                    skip_dates = reusable_trade_dates(conn) if snapshot_for_refresh and snapshot_for_refresh["data_source"] == "tushare" else set()
-                    dataset = TushareDataProvider(max_stocks=0, skip_trade_dates=skip_dates, progress_callback=progress).fetch()
+                    dataset = free_data_provider(conn, progress).fetch()
                     progress("准备写入 SQLite", 0, 100)
-                    if skip_dates:
+                    if table_count(conn, "stock_daily") > 0:
                         save_dataset_incremental(conn, dataset, progress_callback=progress)
                         mode = "增量"
                     else:
@@ -123,7 +121,7 @@ def main() -> None:
                         mode = "全量"
                     st.success(f"{mode}刷新完成 · 股票池 {len(dataset.stock_basic)} 只 · 新增日线 {len(dataset.stock_daily)} 条")
                 except Exception as exc:
-                    st.error(f"Tushare 刷新失败：{exc}")
+                    st.error(f"免费数据源刷新失败：{exc}")
 
             col1, col2 = st.columns([3, 1])
             with col1:
@@ -135,8 +133,7 @@ def main() -> None:
             with col2:
                 if st.button("🔄", use_container_width=True, help="快速：刷新+运行", disabled=not can_run_real_strategy):
                     progress = progress_widgets(st, "批量刷新并运行")
-                    skip_dates = reusable_trade_dates(conn)
-                    dataset = TushareDataProvider(max_stocks=0, skip_trade_dates=skip_dates, progress_callback=progress).fetch()
+                    dataset = free_data_provider(conn, progress).fetch()
                     progress("准备写入 SQLite", 0, 100)
                     save_dataset_incremental(conn, dataset, progress_callback=progress)
                     progress("数据写入完成，准备运行策略", 100, 100)
@@ -144,7 +141,7 @@ def main() -> None:
                     st.success(f"刷新+策略完成 · 候选 {summary.candidate_count} 只")
 
             if not can_run_real_strategy:
-                st.caption("请先刷新 Tushare 全市场数据")
+                st.caption("请先刷新免费全市场数据")
 
             st.markdown('<div class="sidebar-section-label">演示数据</div>', unsafe_allow_html=True)
             st.caption("用于功能演示，会清空真实数据。")
@@ -185,15 +182,15 @@ def main() -> None:
                     )
 
         if table_count(conn, "stock_daily") == 0:
-            render_empty_state(st, "还没有行情数据", "请先在左侧刷新 Tushare 数据，或初始化样例数据用于演示。")
+            render_empty_state(st, "还没有行情数据", "请先在左侧刷新免费数据，或初始化样例数据用于演示。")
             return
         snapshot = current_snapshot(conn)
-        if snapshot is None or snapshot["data_source"] != "tushare":
+        if snapshot is None or snapshot["data_source"] == "sample":
             render_snapshot_bar(st, snapshot) if snapshot is not None else None
             render_empty_state(
                 st,
-                "尚未加载 Tushare 全市场数据",
-                "系统默认只使用 Tushare 作为真实数据源。左侧“演示数据”不会进入默认工作流，请点击“刷新 Tushare 全市场”。",
+                "尚未加载真实全市场数据",
+                "系统默认使用免费真实数据源作为工作流。左侧“演示数据”不会进入默认工作流，请点击“刷新免费全市场”。",
             )
             return
         if snapshot is not None:
@@ -1005,7 +1002,7 @@ def progress_widgets(st, title: str):
 
 
 def render_header(st, snapshot, latest_log) -> None:
-    is_real_snapshot = snapshot is not None and snapshot["data_source"] == "tushare"
+    is_real_snapshot = snapshot is not None and snapshot["data_source"] != "sample"
     source = snapshot["data_source"] if is_real_snapshot else "—"
     stock_count = snapshot["stock_count"] if is_real_snapshot else 0
     candidate_count = latest_log["candidate_count"] if latest_log is not None and is_real_snapshot else "—"
@@ -1233,6 +1230,19 @@ def reusable_trade_dates(conn, keep_recent: int = 5) -> set[str]:
     if len(dates) <= keep_recent:
         return set()
     return set(dates[:-keep_recent])
+
+
+def free_data_provider(conn, progress_callback=None) -> AKShareDataProvider:
+    stock_basic = read_sql(conn, "SELECT * FROM stock_basic") if table_count(conn, "stock_basic") > 0 else None
+    financials = read_sql(conn, "SELECT * FROM financials") if table_count(conn, "financials") > 0 else None
+    latest_row = conn.execute("SELECT MAX(trade_date) AS trade_date FROM stock_daily").fetchone()
+    latest_trade_date = str(latest_row["trade_date"] or "") if latest_row else ""
+    return AKShareDataProvider(
+        existing_stock_basic=stock_basic,
+        existing_financials=financials,
+        existing_latest_trade_date=latest_trade_date or None,
+        progress_callback=progress_callback,
+    )
 
 
 def render_market_overview(st, conn) -> None:

@@ -227,40 +227,234 @@ class SampleDataProvider:
 class AKShareDataProvider:
     source_name = "akshare"
 
-    def __init__(self, max_stocks: int = 80) -> None:
-        self.max_stocks = max_stocks
+    def __init__(
+        self,
+        max_stocks: int | None = None,
+        lookback_days: int | None = None,
+        existing_stock_basic: pd.DataFrame | None = None,
+        existing_financials: pd.DataFrame | None = None,
+        existing_latest_trade_date: str | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> None:
+        self.max_stocks = max_stocks if max_stocks is not None else _load_int_env("FREE_MAX_STOCKS", 0)
+        self.lookback_days = lookback_days if lookback_days is not None else _load_int_env("FREE_LOOKBACK_DAYS", 430)
+        self.existing_stock_basic = existing_stock_basic
+        self.existing_financials = existing_financials
+        self.existing_latest_trade_date = existing_latest_trade_date
+        self.progress_callback = progress_callback
+
+    def _emit(self, message: str, current: int, total: int = 100) -> None:
+        if self.progress_callback:
+            self.progress_callback(message, current, total)
 
     def fetch(self) -> MarketDataset:
+        self._emit("连接免费数据源 AKShare / 腾讯 / 东方财富", 0, 100)
+        stock_basic = self._stock_basic()
+        if self.max_stocks and self.max_stocks > 0:
+            stock_basic = stock_basic.head(self.max_stocks).copy()
+        if stock_basic.empty:
+            raise RuntimeError("免费数据源未能获得股票池")
+
+        start_date, end_date = self._date_range()
+        index_daily = self._fetch_index_daily(start_date, end_date)
+        latest_index_date = str(index_daily["trade_date"].max()) if not index_daily.empty else ""
+        stock_daily = self._fetch_stock_daily(stock_basic, start_date, end_date, latest_index_date)
+        if stock_daily.empty:
+            raise RuntimeError("免费数据源未能获得个股日线")
+        latest_trade_date = str(stock_daily["trade_date"].max())
+        stock_basic, stock_daily = _mark_suspended_by_latest_bar(stock_basic, stock_daily, latest_trade_date)
+        industry_daily = _build_industry_daily_from_frames(stock_basic, stock_daily)
+        financials = self._financials(stock_basic)
+        return MarketDataset(stock_basic, index_daily, stock_daily, industry_daily, financials, self.source_name)
+
+    def _stock_basic(self) -> pd.DataFrame:
+        existing = self.existing_stock_basic.copy() if self.existing_stock_basic is not None else pd.DataFrame()
+        if not existing.empty:
+            self._emit(f"复用本地股票池：{len(existing)} 只", 5, 100)
+            required = ["code", "name", "industry", "list_date", "is_st", "is_delist_risk", "is_suspended"]
+            for column in required:
+                if column not in existing.columns:
+                    existing[column] = "" if column in {"name", "industry", "list_date"} else 0
+            existing["code"] = existing["code"].astype(str).str.zfill(6)
+            existing["industry"] = existing["industry"].fillna("未分类").replace("", "未分类")
+            return existing[required].drop_duplicates("code", keep="last")
+
+        self._emit("读取免费股票列表", 5, 100)
         import akshare as ak
 
-        spot = ak.stock_zh_a_spot_em()
-        required = {"代码", "名称"}
-        if not required.issubset(set(spot.columns)):
-            raise RuntimeError("AKShare stock_zh_a_spot_em returned unexpected columns")
-        spot = spot.head(self.max_stocks).copy()
+        spot = _akshare_call_with_retries(ak.stock_zh_a_spot_em)
+        if spot.empty or not {"代码", "名称"}.issubset(set(spot.columns)):
+            spot = _akshare_call_with_retries(ak.stock_zh_a_spot)
+        if spot.empty or not {"代码", "名称"}.issubset(set(spot.columns)):
+            raise RuntimeError("免费股票列表接口返回字段不完整")
+        if "所属行业" not in spot.columns:
+            spot["所属行业"] = "未分类"
         basics = pd.DataFrame(
             {
                 "code": spot["代码"].astype(str),
                 "name": spot["名称"].astype(str),
-                "industry": "未分类",
+                "industry": spot["所属行业"].astype(str).replace("", "未分类"),
                 "list_date": "",
                 "is_st": spot["名称"].astype(str).str.contains("ST").astype(int),
                 "is_delist_risk": spot["名称"].astype(str).str.contains("退").astype(int),
             }
         )
         basics["is_suspended"] = 0
-        sample = SampleDataProvider().fetch()
-        # MVP keeps AKShare as a replaceable live source boundary. If partial AKShare
-        # endpoints are unavailable, use live basics with deterministic market bars.
-        sample.stock_basic = basics
-        return MarketDataset(
-            sample.stock_basic,
-            sample.index_daily,
-            sample.stock_daily,
-            sample.industry_daily,
-            sample.financials,
-            self.source_name,
+        basics["code"] = basics["code"].astype(str).str.zfill(6)
+        return basics.drop_duplicates("code", keep="last")
+
+    def _date_range(self) -> tuple[str, str]:
+        end = date.today()
+        if self.existing_latest_trade_date:
+            try:
+                start = pd.Timestamp(self.existing_latest_trade_date).date() - timedelta(days=10)
+            except Exception:
+                start = end - timedelta(days=self.lookback_days)
+        else:
+            start = end - timedelta(days=self.lookback_days)
+        return start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+
+    def _fetch_stock_daily(
+        self,
+        stock_basic: pd.DataFrame,
+        start_date: str,
+        end_date: str,
+        latest_trade_date: str = "",
+    ) -> pd.DataFrame:
+        import akshare as ak
+
+        spot_daily = self._fetch_spot_daily(stock_basic, latest_trade_date)
+        if len(spot_daily) >= max(1, int(len(stock_basic) * 0.80)):
+            return spot_daily
+
+        rows = []
+        total = len(stock_basic)
+        for idx, code in enumerate(stock_basic["code"].astype(str), start=1):
+            if idx == 1 or idx % 100 == 0 or idx == total:
+                self._emit(f"免费源读取个股日线：{idx}/{total}", 10 + int(idx / max(total, 1) * 55), 100)
+            hist = pd.DataFrame()
+            try:
+                hist = _akshare_call_with_retries(
+                    ak.stock_zh_a_hist_tx,
+                    symbol=_tencent_stock_symbol(code),
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust="qfq",
+                    retries=2,
+                    delay_seconds=0.5,
+                )
+                hist = _normalize_tencent_stock_hist(hist, code)
+            except Exception:
+                hist = pd.DataFrame()
+            if hist.empty:
+                try:
+                    hist = _akshare_call_with_retries(
+                        ak.stock_zh_a_hist,
+                        symbol=code,
+                        period="daily",
+                        start_date=start_date,
+                        end_date=end_date,
+                        adjust="qfq",
+                        retries=2,
+                        delay_seconds=0.5,
+                    )
+                except Exception:
+                    hist = pd.DataFrame()
+                if not hist.empty:
+                    hist = _normalize_eastmoney_stock_hist(hist)
+            if not hist.empty:
+                if latest_trade_date:
+                    hist = hist[hist["trade_date"].astype(str) >= latest_trade_date].copy()
+            if not hist.empty:
+                rows.append(hist)
+        if not rows:
+            return _empty_stock_daily_frame()
+        daily = pd.concat(rows, ignore_index=True)
+        daily["is_suspended"] = 0
+        daily["is_limit_up"] = daily["pct_chg"].ge(9.5).astype(int)
+        daily["is_limit_down"] = daily["pct_chg"].le(-9.5).astype(int)
+        return daily
+
+    def _fetch_spot_daily(self, stock_basic: pd.DataFrame, latest_trade_date: str) -> pd.DataFrame:
+        import akshare as ak
+
+        self._emit("免费源读取新浪全市场行情", 10, 100)
+        try:
+            spot = _akshare_call_with_retries(ak.stock_zh_a_spot, retries=2, delay_seconds=1.0)
+        except Exception:
+            spot = pd.DataFrame()
+        if spot.empty:
+            try:
+                self._emit("新浪行情不可用，切换东方财富全市场行情", 10, 100)
+                spot = _akshare_call_with_retries(ak.stock_zh_a_spot_em, retries=2, delay_seconds=1.0)
+            except Exception:
+                spot = pd.DataFrame()
+        if spot.empty or not {"代码", "最新价", "今开", "最高", "最低", "成交量", "成交额", "涨跌幅"}.issubset(set(spot.columns)):
+            return _empty_stock_daily_frame()
+        frame = spot.copy()
+        frame["code"] = frame["代码"].astype(str).str.replace(r"^[a-zA-Z]+", "", regex=True).str.zfill(6)
+        allowed = set(stock_basic["code"].astype(str).str.zfill(6))
+        frame = frame[frame["code"].isin(allowed)].copy()
+        if frame.empty:
+            return _empty_stock_daily_frame()
+        trade_date = latest_trade_date or date.today().strftime("%Y-%m-%d")
+        daily = pd.DataFrame(
+            {
+                "code": frame["code"],
+                "trade_date": trade_date,
+                "open": pd.to_numeric(frame["今开"], errors="coerce").fillna(0.0),
+                "high": pd.to_numeric(frame["最高"], errors="coerce").fillna(0.0),
+                "low": pd.to_numeric(frame["最低"], errors="coerce").fillna(0.0),
+                "close": pd.to_numeric(frame["最新价"], errors="coerce").fillna(0.0),
+                "volume": pd.to_numeric(frame["成交量"], errors="coerce").fillna(0.0) / 100,
+                "amount": pd.to_numeric(frame["成交额"], errors="coerce").fillna(0.0),
+                "pct_chg": pd.to_numeric(frame["涨跌幅"], errors="coerce").fillna(0.0),
+                "turnover_rate": 0.0,
+            }
         )
+        daily = daily[(daily["close"] > 0) & (daily["high"] > 0) & (daily["low"] > 0)].copy()
+        daily["is_suspended"] = 0
+        daily["is_limit_up"] = daily["pct_chg"].ge(9.5).astype(int)
+        daily["is_limit_down"] = daily["pct_chg"].le(-9.5).astype(int)
+        self._emit(f"新浪全市场行情完成：{len(daily)} 条", 64, 100)
+        return daily
+
+    def _fetch_index_daily(self, start_date: str, end_date: str) -> pd.DataFrame:
+        import akshare as ak
+
+        specs = [
+            ("sh000300", "000300", "沪深300"),
+            ("sh000905", "000905", "中证500"),
+            ("sh000852", "000852", "中证1000"),
+            ("sz399303", "399303", "国证2000"),
+            ("sz399006", "399006", "创业板指"),
+            ("sh000001", "000001", "上证指数"),
+            ("sz399001", "399001", "深证成指"),
+        ]
+        frames = []
+        for idx, (symbol, index_code, index_name) in enumerate(specs, start=1):
+            self._emit(f"免费源读取指数：{index_name}", 68 + int(idx / len(specs) * 10), 100)
+            try:
+                hist = _akshare_call_with_retries(ak.stock_zh_index_daily_tx, symbol=symbol, retries=2, delay_seconds=0.5)
+            except Exception:
+                hist = pd.DataFrame()
+            if hist.empty:
+                continue
+            frame = _normalize_tencent_index_hist(hist, index_code, index_name, start_date, end_date)
+            if not frame.empty:
+                frames.append(frame)
+        if frames:
+            return pd.concat(frames, ignore_index=True)
+        sample = SampleDataProvider().fetch()
+        return sample.index_daily
+
+    def _financials(self, stock_basic: pd.DataFrame) -> pd.DataFrame:
+        existing = self.existing_financials.copy() if self.existing_financials is not None else pd.DataFrame()
+        if not existing.empty:
+            self._emit("复用本地最近财务指标", 82, 100)
+            return existing
+        self._emit("免费源未配置批量财务接口，使用缺失标记", 82, 100)
+        return pd.DataFrame([_empty_financial_row(code) for code in stock_basic["code"].astype(str)])
 
 
 class TushareDataProvider:
@@ -741,10 +935,6 @@ class HybridDataProvider:
 
     def fetch(self) -> MarketDataset:
         try:
-            return TushareDataProvider().fetch()
-        except Exception:
-            pass
-        try:
             return AKShareDataProvider().fetch()
         except Exception:
             return SampleDataProvider().fetch()
@@ -1044,6 +1234,83 @@ def _empty_industry_daily_frame() -> pd.DataFrame:
     )
 
 
+def _normalize_eastmoney_stock_hist(hist: pd.DataFrame) -> pd.DataFrame:
+    column_map = {
+        "股票代码": "code",
+        "日期": "trade_date",
+        "开盘": "open",
+        "最高": "high",
+        "最低": "low",
+        "收盘": "close",
+        "成交量": "volume",
+        "成交额": "amount",
+        "涨跌幅": "pct_chg",
+        "换手率": "turnover_rate",
+    }
+    frame = hist.rename(columns=column_map).copy()
+    required = ["code", "trade_date", "open", "high", "low", "close", "volume", "amount", "pct_chg", "turnover_rate"]
+    for column in required:
+        if column not in frame.columns:
+            frame[column] = 0.0 if column not in {"code", "trade_date"} else ""
+    frame["code"] = frame["code"].astype(str).str.zfill(6)
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"]).dt.strftime("%Y-%m-%d")
+    for column in ["open", "high", "low", "close", "volume", "amount", "pct_chg", "turnover_rate"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+    return frame[required]
+
+
+def _normalize_tencent_stock_hist(hist: pd.DataFrame, code: str) -> pd.DataFrame:
+    if hist.empty:
+        return _empty_stock_daily_frame()
+    frame = hist.rename(
+        columns={
+            "date": "trade_date",
+            "open": "open",
+            "close": "close",
+            "high": "high",
+            "low": "low",
+            "amount": "volume",
+        }
+    ).copy()
+    frame["code"] = str(code).zfill(6)
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"]).dt.strftime("%Y-%m-%d")
+    for column in ["open", "high", "low", "close", "volume"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+    frame["amount"] = frame["volume"] * frame["close"] * 100
+    frame["pct_chg"] = frame["close"].pct_change().fillna(0.0) * 100
+    frame["turnover_rate"] = 0.0
+    return frame[["code", "trade_date", "open", "high", "low", "close", "volume", "amount", "pct_chg", "turnover_rate"]]
+
+
+def _normalize_tencent_index_hist(
+    hist: pd.DataFrame,
+    index_code: str,
+    index_name: str,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    frame = hist.copy()
+    frame["trade_date"] = pd.to_datetime(frame["date"]).dt.strftime("%Y-%m-%d")
+    start = pd.to_datetime(start_date).strftime("%Y-%m-%d")
+    end = pd.to_datetime(end_date).strftime("%Y-%m-%d")
+    frame = frame[(frame["trade_date"] >= start) & (frame["trade_date"] <= end)].copy()
+    if frame.empty:
+        return pd.DataFrame(columns=["index_code", "index_name", "trade_date", "open", "high", "low", "close", "amount"])
+    for column in ["open", "high", "low", "close", "amount"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+    frame["index_code"] = index_code
+    frame["index_name"] = index_name
+    frame["amount"] = frame["amount"] * 100
+    return frame[["index_code", "index_name", "trade_date", "open", "high", "low", "close", "amount"]]
+
+
+def _tencent_stock_symbol(code: str) -> str:
+    code = str(code).zfill(6)
+    if code.startswith(("6", "9")):
+        return f"sh{code}"
+    return f"sz{code}"
+
+
 def _latest_trade_date_from_db_or_dataset(conn, dataset: MarketDataset) -> str:
     if not dataset.stock_daily.empty:
         return str(dataset.stock_daily["trade_date"].max())
@@ -1086,6 +1353,18 @@ def _load_bool_env(name: str, default: bool) -> bool:
 
 
 def _tushare_call_with_retries(func, retries: int = 3, delay_seconds: float = 1.5, **kwargs):
+    last_error = None
+    for attempt in range(retries):
+        try:
+            return func(**kwargs)
+        except Exception as exc:
+            last_error = exc
+            if attempt < retries - 1:
+                time.sleep(delay_seconds * (attempt + 1))
+    raise last_error
+
+
+def _akshare_call_with_retries(func, retries: int = 3, delay_seconds: float = 1.0, **kwargs):
     last_error = None
     for attempt in range(retries):
         try:

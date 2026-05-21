@@ -44,14 +44,22 @@ uv run streamlit run app.py
 
 ```powershell
 uv run a-stock-selector init          # 建库并写入样例数据
-uv run a-stock-selector fetch         # 尝试 Tushare、AKShare，失败后回退样例数据
+uv run a-stock-selector fetch         # 使用免费数据源刷新全市场数据
 uv run a-stock-selector run           # 运行策略并写入 strategy_result
 uv run a-stock-selector run --refresh # 先刷新数据再运行策略
 ```
 
-## Tushare Token
+## 免费数据源
 
-真实数据建议优先使用 Tushare。不要把 token 写进代码，复制 `.env.example` 为 `.env` 后填写：
+当前默认真实数据工作流不再依赖 Tushare，优先使用 AKShare 聚合的免费接口：
+
+- 新浪全市场行情：用于快速补充最新交易日全市场日线。
+- 腾讯指数/个股日线：用于核心指数和个股历史补充。
+- 东方财富接口：作为个股历史行情兜底。
+
+如果本地库已有 `stock_basic`、`financials`、历史 `stock_daily`，刷新时会优先复用本地股票基础信息和财务数据，只追加最新行情，避免再次卡在 Tushare 财务分块接口。
+
+复制 `.env.example` 为 `.env` 后可按需调整免费源扫描参数：
 
 ```powershell
 Copy-Item .env.example .env
@@ -61,16 +69,14 @@ notepad .env
 或在当前终端设置环境变量：
 
 ```powershell
-$env:TUSHARE_TOKEN="你的token"
-$env:TUSHARE_MAX_STOCKS="0"
-$env:TUSHARE_LOOKBACK_DAYS="430"
-$env:TUSHARE_FETCH_TURNOVER="0"
+$env:FREE_MAX_STOCKS="0"
+$env:FREE_LOOKBACK_DAYS="430"
 uv run a-stock-selector fetch
 ```
 
-数据源优先级为 `Tushare -> AKShare -> Sample`。如果没有配置 token，程序会自动跳过 Tushare。
+默认数据源优先级为 `AKShare 免费源 -> Sample`。Tushare 相关代码保留为可选兼容实现，但不再作为默认刷新路径。
 
-`TUSHARE_MAX_STOCKS` 控制扫描股票数量。设为 0 表示全市场扫描；程序会按交易日批量拉取行情，并按报告期批量拉取财务指标。`TUSHARE_LOOKBACK_DAYS` 默认 430，用于满足 250 日新高和米内尔维尼趋势模板所需历史长度。`TUSHARE_FETCH_TURNOVER=0` 会跳过全市场换手率取数以显著提速；行情金额、成交量和指数金额仍会用于活跃度与突破质量判断。
+`FREE_MAX_STOCKS` 控制扫描股票数量，设为 0 表示全市场扫描；`FREE_LOOKBACK_DAYS` 默认 430，用于满足 250 日新高和米内尔维尼趋势模板所需历史长度。由于免费源财务数据覆盖不稳定，当前刷新会优先复用本地最近财报数据；财务缺失会在基本面状态和剔除原因中提示。
 
 ## 说明
 

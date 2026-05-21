@@ -6,8 +6,8 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import PROJECT_ROOT
-from .data_provider import SampleDataProvider, TushareDataProvider, save_dataset, save_dataset_incremental
-from .db import DEFAULT_DB_PATH, connect, init_db, table_count
+from .data_provider import AKShareDataProvider, SampleDataProvider, save_dataset, save_dataset_incremental
+from .db import DEFAULT_DB_PATH, connect, init_db, read_sql, table_count
 from .strategy import run_strategy
 
 
@@ -54,7 +54,7 @@ def main() -> None:
     parser.add_argument("--db", default=str(DEFAULT_DB_PATH), help="SQLite database path")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="Create database and load sample data")
-    sub.add_parser("fetch", help="Fetch full-market data from Tushare")
+    sub.add_parser("fetch", help="Fetch full-market data from free sources")
     run_parser = sub.add_parser("run", help="Run selector strategy")
     run_parser.add_argument("--refresh", action="store_true", help="Refresh data before running")
     sub.add_parser("observe", help="Export latest post-market observation record")
@@ -68,9 +68,8 @@ def main() -> None:
             print(f"initialized {args.db} with {table_count(conn, 'stock_basic')} stocks")
             return
         if args.command == "fetch":
-            skip_dates = _reusable_trade_dates(conn) if _current_source(conn) == "tushare" else set()
-            dataset = TushareDataProvider(max_stocks=0, skip_trade_dates=skip_dates).fetch()
-            if skip_dates:
+            dataset = _free_provider(conn).fetch()
+            if table_count(conn, "stock_daily") > 0:
                 save_dataset_incremental(conn, dataset)
             else:
                 save_dataset(conn, dataset)
@@ -78,15 +77,14 @@ def main() -> None:
             return
         if args.command == "run":
             if args.refresh or table_count(conn, "stock_daily") == 0:
-                skip_dates = _reusable_trade_dates(conn) if _current_source(conn) == "tushare" else set()
-                dataset = TushareDataProvider(max_stocks=0, skip_trade_dates=skip_dates).fetch()
-                if skip_dates:
+                dataset = _free_provider(conn).fetch()
+                if table_count(conn, "stock_daily") > 0:
                     save_dataset_incremental(conn, dataset)
                 else:
                     save_dataset(conn, dataset)
             row = conn.execute("SELECT data_source FROM data_snapshot WHERE id = 1").fetchone()
-            if not row or row["data_source"] != "tushare":
-                raise SystemExit("No Tushare dataset loaded. Run `a-stock-selector fetch` first.")
+            if not row:
+                raise SystemExit("No market dataset loaded. Run `a-stock-selector fetch` first.")
             summary = run_strategy(conn)
             print(
                 "batch_id={batch_id} trade_date={trade_date} candidates={candidate_count} "
@@ -504,6 +502,19 @@ def _format_observation_output(observation: dict[str, object]) -> str:
 def _current_source(conn) -> str:
     row = conn.execute("SELECT data_source FROM data_snapshot WHERE id = 1").fetchone()
     return str(row["data_source"]) if row else ""
+
+
+def _free_provider(conn, progress_callback=None) -> AKShareDataProvider:
+    stock_basic = read_sql(conn, "SELECT * FROM stock_basic") if table_count(conn, "stock_basic") > 0 else None
+    financials = read_sql(conn, "SELECT * FROM financials") if table_count(conn, "financials") > 0 else None
+    latest_row = conn.execute("SELECT MAX(trade_date) AS trade_date FROM stock_daily").fetchone()
+    latest_trade_date = str(latest_row["trade_date"] or "") if latest_row else ""
+    return AKShareDataProvider(
+        existing_stock_basic=stock_basic,
+        existing_financials=financials,
+        existing_latest_trade_date=latest_trade_date or None,
+        progress_callback=progress_callback,
+    )
 
 
 def _reusable_trade_dates(conn, keep_recent: int = 5) -> set[str]:
