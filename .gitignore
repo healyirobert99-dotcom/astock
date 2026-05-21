@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.playwright-cli/
+*.pyc
+data/
+data/*.sqlite3
+data/*.db
+.env
+.streamlit/secrets.toml

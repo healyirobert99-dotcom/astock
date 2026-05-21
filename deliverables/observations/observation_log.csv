@@ -1,0 +1,7 @@
+﻿recorded_at,trade_date,batch_id,market_score,market_status,warning_pool_count,focus_pool_count,formal_count,watch_count,technical_count,near_count,watch_mainline_count,candidate_mainline_count,near_mainline_count,confirmed_mainline_count,downtrend_mainline_count,has_trade_plan,reasons,markdown_path,candidates_path,status,error
+2026-05-21T09:14:41,2026-05-20,f60623ef70b7,57.17,观察,,,0,0,10,0,,,,,,0,市场评分低于 65，不生成正式买入建议；主线仍处于冷启动阶段，确认至少需要 3-5 个交易日评分历史；主线未连续确认，通过技术筛选但行业未确认；基本面数据缺失或过滤较多,C:\Users\wanyu\Documents\量化选股\deliverables\observations\2026-05-20.md,C:\Users\wanyu\Documents\量化选股\deliverables\candidates_latest.csv,success,
+2026-05-21T10:32:55,2026-05-20,f60623ef70b7,57.17,观察,,,0,0,10,0,,,,,,0,0,0,0,0,0
+2026-05-21T10:34:10,2026-05-20,030305b9c5f0,57.17,观察,,,0,0,10,0,,,,,,0,0,1,0,0,0
+2026-05-21T10:53:25,2026-05-20,c42e3883d922,57.17,观察,,,0,25,0,25,,,,,,10,0,0,0,1,0
+2026-05-21T10:54:32,2026-05-20,c42e3883d922,57.17,观察,0,25,0,25,10,0,0,0,1,0,0,0,正式候选为 0，但预警个股池 0 只、重点观察个股池 25 只，说明主线或个股正在接近条件；市场评分低于 65，不生成正式买入建议；主线仍处于冷启动阶段，确认至少需要 3-5 个交易日评分历史；基本面数据缺失或过滤较多；当前存在接近确认主线，说明市场方向正在形成；基本面数据存在缺失或代理字段不足,C:\Users\wanyu\Documents\量化选股\deliverables\observations\2026-05-20.md,C:\Users\wanyu\Documents\量化选股\deliverables\candidates_latest.csv,success,
+2026-05-21T15:42:22,,,,,,,,,,,,,,,,,python command not found (CommandNotFoundException) while running: python -m a_stock_selector.cli run --refresh,,,failed,python command not found (CommandNotFoundException) while running: python -m a_stock_selector.cli run --refresh
