@@ -68,7 +68,7 @@ def run_strategy(
     after_keypoint = int(results["keypoint_date"].notna().sum()) if "keypoint_date" in results else 0
     after_mainline = int(
         results["candidate_layer"]
-        .isin(["预警个股池", "重点观察个股池", "正式候选股池", "技术突破候选"])
+        .isin(["预警个股池", "重点观察个股池", "正式候选股池", "小仓试错候选", "技术突破候选"])
         .sum()
     )
     after_market = after_mainline if float(market["total_score"]) >= config.MARKET_TRADE_SCORE else 0
@@ -615,6 +615,7 @@ def select_stocks(
     daily_groups = {code: group.sort_values("trade_date").copy() for code, group in daily.groupby("code")}
     finance_groups = {code: group for code, group in financials.groupby("code")}
     industry_map = industry_scores.set_index("industry").to_dict("index")
+    industry_count = max(1, len(industry_scores))
     rows: list[dict] = []
 
     total = len(basics)
@@ -774,38 +775,7 @@ def select_stocks(
                 )
             )
             continue
-        if mainline_stage in {"普通", "退潮观察"}:
-            missing_count = 1 + (1 if float(market["total_score"]) < config.MARKET_TRADE_SCORE else 0)
-            candidate_layer = "接近候选" if missing_count == 1 else "技术突破候选"
-            reason = "所属行业进入退潮观察，不生成新的买入计划" if mainline_stage == "退潮观察" else "所属行业未进入主线观察层级"
-            rows.append(
-                _excluded_row(
-                    stock,
-                    market,
-                    reason,
-                    trend_template_type=trend_type,
-                    fundamental_status=fund_status,
-                    candidate_layer=candidate_layer,
-                    rejected_reason_detail="主线未确认" if mainline_stage == "普通" else "退潮观察",
-                    industry_score=float(industry_state.get("base_score", industry_state.get("score", 0))),
-                    keypoint=keypoint,
-                    mainline_status=mainline_stage,
-                    mainline_base_score=mainline_base_score,
-                    keypoint_distance_pct=_keypoint_distance(stock_daily, keypoint),
-                )
-            )
-            continue
-
         latest = stock_daily.iloc[-1]
-        plan = _build_trade_plan(
-            latest=latest,
-            keypoint=keypoint,
-            market=market,
-            industry_state=industry_state,
-            trend_type=trend_type,
-            config=config,
-            stock_daily=stock_daily,
-        )
         include_reason = "；".join(
             [
                 "通过P0基本面硬过滤",
@@ -816,25 +786,80 @@ def select_stocks(
                 f"所属行业状态：{mainline_stage}",
             ]
         )
+
         if market_score < config.MARKET_TRADE_SCORE:
             candidate_layer = "重点观察个股池" if market_score >= config.MARKET_MIN_SCORE else "技术突破候选"
             plan = _observation_pool_plan(
                 candidate_layer,
                 watch_price=round(float(latest["close"]), 2),
                 trigger_price=round(float(keypoint["keypoint_price"]), 2),
-                suggested_action="重点观察，等待主线确认"
+                suggested_action="重点观察，等待市场评分恢复"
                 if candidate_layer == "重点观察个股池"
                 else "技术突破，等待市场或主线确认",
             )
-            status = "excluded"
-            exclude_reason = "市场评分不足"
-            rejected_reason_detail = "市场评分不足"
-        elif mainline_stage == "确认主线":
+            rows.append(
+                _candidate_row(
+                    stock=stock,
+                    market=market,
+                    industry_state=industry_state,
+                    trend_type=trend_type,
+                    fund_status=fund_status,
+                    candidate_layer=candidate_layer,
+                    status="excluded",
+                    plan=plan,
+                    keypoint=keypoint,
+                    nearest_keypoint=nearest_keypoint,
+                    include_reason=include_reason,
+                    exclude_reason="市场评分不足",
+                    rejected_reason_detail="市场评分不足",
+                    entry_channel="观察通道",
+                    candidate_grade="观察",
+                )
+            )
+            continue
+
+        if mainline_stage == "退潮观察":
+            missing_count = 1 + (1 if float(market["total_score"]) < config.MARKET_TRADE_SCORE else 0)
+            candidate_layer = "接近候选" if missing_count == 1 else "技术突破候选"
+            rows.append(
+                _excluded_row(
+                    stock,
+                    market,
+                    "所属行业进入退潮观察，不生成新的买入计划",
+                    trend_template_type=trend_type,
+                    fundamental_status=fund_status,
+                    candidate_layer=candidate_layer,
+                    rejected_reason_detail="退潮观察",
+                    industry_score=float(industry_state.get("base_score", industry_state.get("score", 0))),
+                    keypoint=keypoint,
+                    mainline_status=mainline_stage,
+                    mainline_base_score=mainline_base_score,
+                    keypoint_distance_pct=_keypoint_distance(stock_daily, keypoint),
+                )
+            )
+            continue
+
+        plan = _build_trade_plan(
+            latest=latest,
+            keypoint=keypoint,
+            market=market,
+            industry_state=industry_state,
+            trend_type=trend_type,
+            config=config,
+            stock_daily=stock_daily,
+        )
+        entry_channel = "观察通道"
+        candidate_grade = "观察"
+        if mainline_stage == "确认主线":
             if plan["suggested_action"] in {"建议试错买入", "建议计划买入"} and float(plan["suggested_position"] or 0) > 0:
                 candidate_layer = "正式候选股池"
                 status = "included"
                 exclude_reason = ""
                 rejected_reason_detail = ""
+                entry_channel = "主线确认通道"
+                candidate_grade = "A：确认主线正式候选"
+                plan = _cap_plan_position(plan, 15.0)
+                plan["risk_warning"] = f"{RISK_WARNING} 所属行业为确认主线，交易计划按正式候选规则生成。"
             else:
                 candidate_layer = "重点观察个股池"
                 plan = _observation_pool_plan(
@@ -846,6 +871,74 @@ def select_stocks(
                 status = "excluded"
                 exclude_reason = "确认主线内个股等待回踩确认"
                 rejected_reason_detail = "等待回踩确认"
+        elif _near_confirm_trial_eligible(
+            mainline_stage,
+            mainline_base_score,
+            trend_type,
+            keypoint,
+            stock_daily,
+            config,
+        ):
+            plan = _leader_breakout_plan(
+                float(keypoint["keypoint_price"]),
+                float(keypoint.get("breakout_close", keypoint["keypoint_price"])),
+                float(keypoint.get("breakout_day_low", float(keypoint["keypoint_price"]) * 0.97)),
+                float(keypoint.get("breakout_ma10", float(keypoint["keypoint_price"]) * 0.96)),
+                market_score,
+                config,
+                suggested_action="建议小仓试错",
+                signal_status="接近确认小仓试错",
+                position_override=8.0 if market_score >= 75 else 5.0,
+            )
+            candidate_layer = "小仓试错候选"
+            status = "included"
+            exclude_reason = ""
+            rejected_reason_detail = ""
+            entry_channel = "接近确认通道"
+            candidate_grade = "B：接近确认小仓候选"
+            plan["risk_warning"] = (
+                f"{RISK_WARNING} 所属主线处于接近确认阶段，尚未达到确认主线标准。"
+                "本信号仅适合小仓试错，需严格执行止损。"
+            )
+        elif _strong_trend_trial_eligible(
+            mainline_stage,
+            industry_state,
+            industry_count,
+            trend_type,
+            keypoint,
+            stock_daily,
+            config,
+        ):
+            plan = _strict_leader_breakout_plan(
+                keypoint,
+                market_score,
+                config,
+                suggested_action="强趋势试错",
+                signal_status="强趋势试错",
+                max_position=5.0 if market_score >= 75 else 3.0,
+            )
+            if _plan_has_valid_buy(plan):
+                candidate_layer = "小仓试错候选"
+                status = "included"
+                exclude_reason = ""
+                rejected_reason_detail = ""
+                entry_channel = "强趋势试错通道"
+                candidate_grade = "C：强趋势试错候选"
+                plan["risk_warning"] = (
+                    f"{RISK_WARNING} 所属主线尚未强确认，该信号基于个股强趋势领先，仅允许小仓试错。"
+                    "若跌破关键点或突破日低点，应立即退出或降级观察。"
+                )
+            else:
+                candidate_layer = "重点观察个股池"
+                plan = _observation_pool_plan(
+                    candidate_layer,
+                    watch_price=round(float(latest["close"]), 2),
+                    trigger_price=round(float(keypoint["keypoint_price"]), 2),
+                    suggested_action="重点观察，等待触发",
+                )
+                status = "excluded"
+                exclude_reason = "强趋势试错止损或买入区间不合法，降级观察"
+                rejected_reason_detail = "等待触发"
         elif mainline_stage == "接近确认":
             candidate_layer = "重点观察个股池"
             plan = _observation_pool_plan(
@@ -855,7 +948,7 @@ def select_stocks(
                 suggested_action="重点观察，等待主线确认",
             )
             status = "excluded"
-            exclude_reason = "主线接近确认但未达到确认主线标准"
+            exclude_reason = "主线接近确认但未达到小仓试错或确认主线标准"
             rejected_reason_detail = "主线未确认"
         elif mainline_stage in {"主线预警", "候选主线"}:
             candidate_layer = "预警个股池" if mainline_stage == "主线预警" else "重点观察个股池"
@@ -869,6 +962,16 @@ def select_stocks(
             )
             status = "excluded"
             exclude_reason = f"{mainline_stage}阶段，仅观察或小仓试错，不进入正式候选"
+            rejected_reason_detail = "主线未确认"
+        elif mainline_stage == "普通":
+            candidate_layer = "技术突破候选"
+            plan = _observation_pool_plan(
+                candidate_layer,
+                watch_price=round(float(latest["close"]), 2),
+                trigger_price=round(float(keypoint["keypoint_price"]), 2),
+            )
+            status = "excluded"
+            exclude_reason = "所属行业未进入主线观察层级"
             rejected_reason_detail = "主线未确认"
         else:
             candidate_layer = "技术突破候选"
@@ -895,6 +998,8 @@ def select_stocks(
                 include_reason=include_reason,
                 exclude_reason=exclude_reason,
                 rejected_reason_detail=rejected_reason_detail,
+                entry_channel=entry_channel,
+                candidate_grade=candidate_grade,
             )
         )
     return pd.DataFrame(rows)
@@ -914,16 +1019,22 @@ def _candidate_row(
     include_reason: str,
     exclude_reason: str,
     rejected_reason_detail: str,
+    entry_channel: str | None = None,
+    candidate_grade: str | None = None,
 ) -> dict[str, object]:
     keypoint = keypoint or {}
     mainline_status = _mainline_trade_stage(industry_state) if industry_state else "普通"
     mainline_base_score = float(industry_state.get("base_score", industry_state.get("score", 0)) or 0) if industry_state else 0.0
+    entry_channel = entry_channel or str(plan.get("entry_channel") or _default_entry_channel(candidate_layer, status))
+    candidate_grade = candidate_grade or str(plan.get("candidate_grade") or _default_candidate_grade(candidate_layer, status))
     return {
         "code": stock["code"],
         "name": stock["name"],
         "industry": stock["industry"],
         "status": status,
         "candidate_layer": candidate_layer,
+        "entry_channel": entry_channel,
+        "candidate_grade": candidate_grade,
         "mainline_status": mainline_status,
         "mainline_base_score": mainline_base_score,
         "keypoint_distance_pct": _coerce_float(
@@ -952,7 +1063,7 @@ def _candidate_row(
         "include_reason": include_reason,
         "exclude_reason": exclude_reason,
         "rejected_reason_detail": rejected_reason_detail,
-        "risk_warning": RISK_WARNING,
+        "risk_warning": str(plan.get("risk_warning") or RISK_WARNING),
     }
 
 
@@ -1088,6 +1199,8 @@ def _observation_pool_plan(
         signal_status = "接近候选"
         trailing = "距离正式候选仍缺少关键条件，不生成正式买入区间"
     return {
+        "entry_channel": "观察通道",
+        "candidate_grade": "观察",
         "signal_status": signal_status,
         "trade_plan_type": "观察计划",
         "suggested_action": action,
@@ -1126,6 +1239,26 @@ def _coerce_float(value: object) -> float | None:
     if not math.isfinite(numeric):
         return None
     return numeric
+
+
+def _default_entry_channel(candidate_layer: str, status: str) -> str:
+    if candidate_layer == "正式候选股池" and status == "included":
+        return "主线确认通道"
+    if candidate_layer == "小仓试错候选" and status == "included":
+        return "强趋势试错通道"
+    if candidate_layer == "剔除":
+        return "剔除通道"
+    return "观察通道"
+
+
+def _default_candidate_grade(candidate_layer: str, status: str) -> str:
+    if candidate_layer == "正式候选股池" and status == "included":
+        return "A：确认主线正式候选"
+    if candidate_layer == "小仓试错候选" and status == "included":
+        return "C：强趋势试错候选"
+    if candidate_layer == "剔除":
+        return "剔除"
+    return "观察"
 
 
 def _emit(callback: ProgressCallback | None, message: str, current: int, total: int) -> None:
@@ -1668,6 +1801,104 @@ def _is_watch_leader_trial(
     return float(industry_state.get("base_score", 0) or 0) >= config.MAINLINE_WATCH_SCORE
 
 
+def _near_confirm_trial_eligible(
+    mainline_stage: str,
+    mainline_base_score: float,
+    trend_type: str,
+    keypoint: dict[str, str | float],
+    stock_daily: pd.DataFrame,
+    config: StrategyConfig,
+) -> bool:
+    return (
+        mainline_stage in {"接近确认", "候选主线"}
+        and mainline_base_score >= config.MAINLINE_CANDIDATE_SCORE
+        and trend_type == "A"
+        and _breakout_quality_excellent(keypoint, stock_daily, config)
+    )
+
+
+def _strong_trend_trial_eligible(
+    mainline_stage: str,
+    industry_state: dict[str, object],
+    industry_count: int,
+    trend_type: str,
+    keypoint: dict[str, str | float],
+    stock_daily: pd.DataFrame,
+    config: StrategyConfig,
+) -> bool:
+    industry_score = float(industry_state.get("base_score", industry_state.get("score", 0)) or 0)
+    rank = int(industry_state.get("rank", 9999) or 9999)
+    rank_top_30 = rank <= max(1, math.ceil(industry_count * 0.30))
+    return (
+        mainline_stage in {"主线预警", "候选主线", "普通"}
+        and (industry_score >= 55 or rank_top_30)
+    ) and (
+        mainline_stage != "退潮观察"
+        and trend_type == "A"
+        and str(keypoint.get("keypoint_type", "")) in {"历史新高", "250日新高"}
+        and _breakout_quality_excellent(keypoint, stock_daily, config)
+    )
+
+
+def _breakout_quality_excellent(
+    keypoint: dict[str, str | float],
+    stock_daily: pd.DataFrame,
+    config: StrategyConfig,
+) -> bool:
+    if str(keypoint.get("keypoint_type", "")) not in {"历史新高", "250日新高", "120日平台突破"}:
+        return False
+    df = stock_daily.sort_values("trade_date").copy()
+    if len(df) < 20:
+        return False
+    df["volume_ma20"] = moving_average(df["volume"], 20)
+    df["ma20"] = moving_average(df["close"], 20)
+    breakout_date = str(keypoint.get("breakout_date") or keypoint.get("keypoint_date") or "")
+    row = df[df["trade_date"].astype(str).eq(breakout_date)].tail(1)
+    if row.empty:
+        row = df.tail(1)
+    latest = row.iloc[-1]
+    volume_ma20 = float(latest["volume_ma20"])
+    ma20 = float(latest["ma20"])
+    close = float(latest["close"])
+    high = float(latest["high"])
+    if volume_ma20 <= 0 or ma20 <= 0 or high <= 0:
+        return False
+    volume_ratio = float(latest["volume"]) / volume_ma20
+    return (
+        volume_ratio >= config.VOLUME_BREAKOUT_MIN_RATIO_20D
+        and volume_ratio <= config.VOLUME_BREAKOUT_MAX_RATIO_20D
+        and close / high >= config.CLOSE_HIGH_MIN_RATIO
+        and close / ma20 < config.LEADER_CLOSE_MA20_MAX_RATIO
+    )
+
+
+def _cap_plan_position(plan: dict[str, float | str | None], max_position: float) -> dict[str, float | str | None]:
+    capped = dict(plan)
+    position = min(float(capped.get("suggested_position") or 0.0), max_position)
+    capped["suggested_position"] = position
+    capped["position_pct"] = position
+    return capped
+
+
+def _plan_has_valid_buy(plan: dict[str, float | str | None]) -> bool:
+    required = ["buy_lower", "buy_upper", "suggested_buy_price", "stop_loss_price", "take_profit_1", "take_profit_2"]
+    if any(plan.get(key) is None for key in required):
+        return False
+    buy_lower = float(plan["buy_lower"])
+    buy_upper = float(plan["buy_upper"])
+    suggested_buy = float(plan["suggested_buy_price"])
+    stop = float(plan["stop_loss_price"])
+    take_1 = float(plan["take_profit_1"])
+    take_2 = float(plan["take_profit_2"])
+    return (
+        buy_lower <= suggested_buy <= buy_upper
+        and stop < suggested_buy
+        and take_1 > suggested_buy
+        and take_2 > take_1
+        and float(plan.get("suggested_position") or 0) > 0
+    )
+
+
 def _plan_no_new_buy(watch_price: float, trigger_price: float, reason: str) -> dict:
     return {
         "signal_status": "重点跟踪",
@@ -1756,6 +1987,48 @@ def _leader_breakout_plan(
         "moving_take_profit_rule": trailing,
         "position_pct": position,
     }
+
+
+def _strict_leader_breakout_plan(
+    keypoint: dict[str, str | float],
+    market_score: float,
+    config: StrategyConfig,
+    suggested_action: str,
+    signal_status: str,
+    max_position: float,
+) -> dict[str, float | str | None]:
+    key_price = float(keypoint["keypoint_price"])
+    breakout_close = float(keypoint.get("breakout_close", key_price))
+    breakout_day_low = float(keypoint.get("breakout_day_low", key_price * 0.97))
+    breakout_ma10 = float(keypoint.get("breakout_ma10", key_price * 0.96))
+    plan = _leader_breakout_plan(
+        key_price,
+        breakout_close,
+        breakout_day_low,
+        breakout_ma10,
+        market_score,
+        config,
+        suggested_action=suggested_action,
+        signal_status=signal_status,
+        position_override=max_position,
+    )
+    strict_stop = round(min(key_price * 0.97, breakout_day_low), 2)
+    plan["stop_loss_price"] = strict_stop
+    plan["stop_loss"] = strict_stop
+    if strict_stop >= float(plan["suggested_buy_price"] or 0) or float(plan["buy_lower"] or 0) > float(plan["buy_upper"] or 0):
+        plan["buy_lower"] = None
+        plan["buy_upper"] = None
+        plan["suggested_buy_price"] = None
+        plan["stop_loss_price"] = None
+        plan["take_profit_1"] = None
+        plan["take_profit_2"] = None
+        plan["buy_range_low"] = None
+        plan["buy_range_high"] = None
+        plan["stop_loss"] = None
+        plan["take_profit"] = None
+        plan["suggested_position"] = 0.0
+        plan["position_pct"] = 0.0
+    return plan
 
 
 def _detect_pullback(
@@ -2008,6 +2281,8 @@ def _excluded_row(
         "industry": stock["industry"],
         "status": "excluded",
         "candidate_layer": candidate_layer,
+        "entry_channel": _default_entry_channel(candidate_layer, "excluded"),
+        "candidate_grade": _default_candidate_grade(candidate_layer, "excluded"),
         "mainline_status": mainline_status,
         "mainline_base_score": mainline_base_score,
         "keypoint_distance_pct": keypoint_distance_pct,
@@ -2053,7 +2328,11 @@ def _excluded_row(
         "include_reason": "",
         "exclude_reason": reason,
         "rejected_reason_detail": detail,
-        "risk_warning": RISK_WARNING,
+        "risk_warning": (
+            f"{RISK_WARNING} 财务数据缺失或存在轻微瑕疵，仅观察，不进入正式候选或小仓试错候选。"
+            if fundamental_status == "C"
+            else RISK_WARNING
+        ),
     }
 
 

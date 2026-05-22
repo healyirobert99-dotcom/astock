@@ -151,6 +151,8 @@ CREATE TABLE IF NOT EXISTS strategy_result (
     industry TEXT NOT NULL,
     status TEXT NOT NULL,
     candidate_layer TEXT NOT NULL DEFAULT '剔除',
+    entry_channel TEXT NOT NULL DEFAULT '剔除通道',
+    candidate_grade TEXT NOT NULL DEFAULT '剔除',
     mainline_status TEXT NOT NULL DEFAULT '',
     mainline_base_score REAL NOT NULL DEFAULT 0,
     keypoint_distance_pct REAL,
@@ -309,6 +311,8 @@ MIGRATION_COLUMNS = {
     },
     "strategy_result": {
         "candidate_layer": "TEXT NOT NULL DEFAULT '剔除'",
+        "entry_channel": "TEXT NOT NULL DEFAULT '剔除通道'",
+        "candidate_grade": "TEXT NOT NULL DEFAULT '剔除'",
         "mainline_status": "TEXT NOT NULL DEFAULT ''",
         "mainline_base_score": "REAL NOT NULL DEFAULT 0",
         "keypoint_distance_pct": "REAL",

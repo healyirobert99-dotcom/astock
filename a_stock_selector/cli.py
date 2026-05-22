@@ -17,6 +17,8 @@ CANDIDATE_EXPORT_COLUMNS = [
     "industry",
     "status",
     "candidate_layer",
+    "entry_channel",
+    "candidate_grade",
     "mainline_status",
     "mainline_base_score",
     "signal_status",
@@ -127,6 +129,8 @@ def export_observation(conn, output_root: Path | None = None) -> dict[str, objec
     ).fetchall()
 
     layer_counts = _candidate_layer_counts(conn, batch_id)
+    entry_channel_counts = _strategy_value_counts(conn, batch_id, "entry_channel")
+    candidate_grade_counts = _strategy_value_counts(conn, batch_id, "candidate_grade")
     mainline_counts = _mainline_status_counts(conn, batch_id)
     has_trade_plan = _has_formal_trade_plan(conn, batch_id)
     reasons = _candidate_empty_reasons(conn, batch_id, run, market)
@@ -135,11 +139,33 @@ def export_observation(conn, output_root: Path | None = None) -> dict[str, objec
     formal_count = _export_latest_candidates(conn, batch_id, candidates_path)
 
     markdown_path = observations_dir / f"{trade_date}.md"
-    markdown = _build_observation_markdown(run, market, top_mainlines, layer_counts, mainline_counts, has_trade_plan, reasons)
+    markdown = _build_observation_markdown(
+        run,
+        market,
+        top_mainlines,
+        layer_counts,
+        mainline_counts,
+        has_trade_plan,
+        reasons,
+        entry_channel_counts=entry_channel_counts,
+        candidate_grade_counts=candidate_grade_counts,
+    )
     markdown_path.write_text(markdown, encoding="utf-8")
 
     log_path = observations_dir / "observation_log.csv"
-    _append_observation_log(log_path, run, market, layer_counts, mainline_counts, has_trade_plan, reasons, markdown_path, candidates_path)
+    _append_observation_log(
+        log_path,
+        run,
+        market,
+        layer_counts,
+        mainline_counts,
+        has_trade_plan,
+        reasons,
+        markdown_path,
+        candidates_path,
+        entry_channel_counts=entry_channel_counts,
+        candidate_grade_counts=candidate_grade_counts,
+    )
 
     return {
         "success": True,
@@ -153,6 +179,7 @@ def export_observation(conn, output_root: Path | None = None) -> dict[str, objec
         "warning_pool_count": int(layer_counts.get("预警个股池", 0)),
         "focus_pool_count": int(layer_counts.get("重点观察个股池", 0)),
         "formal_count": int(layer_counts.get("正式候选股池", formal_count)),
+        "trial_count": int(layer_counts.get("小仓试错候选", 0)),
         "watch_count": int(layer_counts.get("重点观察个股池", 0)),
         "technical_count": int(layer_counts.get("技术突破候选", 0)),
         "near_count": int(layer_counts.get("接近候选", 0)),
@@ -178,9 +205,24 @@ def _candidate_layer_counts(conn, batch_id: str) -> dict[str, int]:
         (batch_id,),
     ).fetchall()
     counts = {str(row["candidate_layer"]): int(row["cnt"]) for row in rows}
-    for layer in ("预警个股池", "重点观察个股池", "正式候选股池", "技术突破候选", "接近候选", "剔除"):
+    for layer in ("预警个股池", "重点观察个股池", "正式候选股池", "小仓试错候选", "技术突破候选", "接近候选", "剔除"):
         counts.setdefault(layer, 0)
     return counts
+
+
+def _strategy_value_counts(conn, batch_id: str, column: str) -> dict[str, int]:
+    if column not in {"entry_channel", "candidate_grade"}:
+        raise ValueError(f"unsupported count column: {column}")
+    rows = conn.execute(
+        f"""
+        SELECT {column} AS value, COUNT(*) AS cnt
+        FROM strategy_result
+        WHERE batch_id = ?
+        GROUP BY {column}
+        """,
+        (batch_id,),
+    ).fetchall()
+    return {str(row["value"] or ""): int(row["cnt"]) for row in rows}
 
 
 def _mainline_status_counts(conn, batch_id: str) -> dict[str, int]:
@@ -205,7 +247,7 @@ def _has_formal_trade_plan(conn, batch_id: str) -> bool:
         SELECT COUNT(*) AS cnt
         FROM strategy_result
         WHERE batch_id = ?
-          AND suggested_action IN ('建议试错买入', '建议计划买入')
+          AND suggested_action IN ('建议试错买入', '建议计划买入', '建议小仓试错', '强趋势试错')
         """,
         (batch_id,),
     ).fetchone()
@@ -218,13 +260,14 @@ def _export_latest_candidates(conn, batch_id: str, path: Path) -> int:
         SELECT {", ".join(CANDIDATE_EXPORT_COLUMNS)}
         FROM strategy_result
         WHERE batch_id = ?
-          AND candidate_layer IN ('预警个股池', '重点观察个股池', '正式候选股池', '技术突破候选', '接近候选')
+          AND candidate_layer IN ('预警个股池', '重点观察个股池', '正式候选股池', '小仓试错候选', '技术突破候选', '接近候选')
         ORDER BY CASE candidate_layer
                     WHEN '正式候选股池' THEN 1
-                    WHEN '重点观察个股池' THEN 2
-                    WHEN '预警个股池' THEN 3
-                    WHEN '技术突破候选' THEN 4
-                    WHEN '接近候选' THEN 5
+                    WHEN '小仓试错候选' THEN 2
+                    WHEN '重点观察个股池' THEN 3
+                    WHEN '预警个股池' THEN 4
+                    WHEN '技术突破候选' THEN 5
+                    WHEN '接近候选' THEN 6
                     ELSE 9
                  END,
                  industry_score DESC, keypoint_price DESC
@@ -317,7 +360,17 @@ def _suggested_position_text(score: float) -> str:
     return "防守观察，不生成买入计划"
 
 
-def _build_observation_markdown(run, market, top_mainlines, layer_counts, mainline_counts, has_trade_plan: bool, reasons: list[str]) -> str:
+def _build_observation_markdown(
+    run,
+    market,
+    top_mainlines,
+    layer_counts,
+    mainline_counts,
+    has_trade_plan: bool,
+    reasons: list[str],
+    entry_channel_counts: dict[str, int] | None = None,
+    candidate_grade_counts: dict[str, int] | None = None,
+) -> str:
     trade_date = str(run["trade_date"])
     market_score = float(market["total_score"])
     risk_level = str(market["risk_level"])
@@ -325,7 +378,12 @@ def _build_observation_markdown(run, market, top_mainlines, layer_counts, mainli
         f"市场评分 {market_score:.1f}，处于{risk_level}状态。"
         f"{'出现正式交易计划，仍需独立复核。' if has_trade_plan else '当前不生成正式买入计划，仅观察主线变化和候选池变化。'}"
     )
-    if not has_trade_plan and (
+    if not has_trade_plan and int(layer_counts.get("小仓试错候选", 0)) > 0:
+        conclusion = (
+            f"市场评分 {market_score:.1f}，处于{risk_level}状态。今日无确认主线正式候选，"
+            "但存在小仓试错候选，说明个股趋势领先于主线确认。仅适合小仓试错或观察，不代表重仓买入。"
+        )
+    elif not has_trade_plan and (
         int(layer_counts.get("预警个股池", 0)) > 0 or int(layer_counts.get("重点观察个股池", 0)) > 0
     ):
         conclusion = (
@@ -383,8 +441,11 @@ def _build_observation_markdown(run, market, top_mainlines, layer_counts, mainli
             f"- 预警个股池数量：{int(layer_counts.get('预警个股池', 0))}",
             f"- 重点观察个股池数量：{int(layer_counts.get('重点观察个股池', 0))}",
             f"- 正式候选股池数量：{int(layer_counts.get('正式候选股池', 0))}",
+            f"- 小仓试错候选数量：{int(layer_counts.get('小仓试错候选', 0))}",
             f"- 技术突破候选数量：{int(layer_counts.get('技术突破候选', 0))}",
             f"- 接近候选数量：{int(layer_counts.get('接近候选', 0))}",
+            f"- entry_channel 分布：{_format_count_distribution(entry_channel_counts or {})}",
+            f"- candidate_grade 分布：{_format_count_distribution(candidate_grade_counts or {})}",
             f"- 是否出现交易计划：{'是' if has_trade_plan else '否'}",
             "",
             "## 五、候选为 0 原因",
@@ -406,6 +467,8 @@ def _append_observation_log(
     reasons: list[str],
     markdown_path: Path,
     candidates_path: Path,
+    entry_channel_counts: dict[str, int] | None = None,
+    candidate_grade_counts: dict[str, int] | None = None,
 ) -> None:
     columns = [
         "recorded_at",
@@ -416,6 +479,7 @@ def _append_observation_log(
         "warning_pool_count",
         "focus_pool_count",
         "formal_count",
+        "trial_count",
         "watch_count",
         "technical_count",
         "near_count",
@@ -424,6 +488,8 @@ def _append_observation_log(
         "near_mainline_count",
         "confirmed_mainline_count",
         "downtrend_mainline_count",
+        "entry_channel_distribution",
+        "candidate_grade_distribution",
         "has_trade_plan",
         "reasons",
         "markdown_path",
@@ -457,6 +523,7 @@ def _append_observation_log(
                 "warning_pool_count": int(layer_counts.get("预警个股池", 0)),
                 "focus_pool_count": int(layer_counts.get("重点观察个股池", 0)),
                 "formal_count": int(layer_counts.get("正式候选股池", 0)),
+                "trial_count": int(layer_counts.get("小仓试错候选", 0)),
                 "watch_count": int(layer_counts.get("重点观察个股池", 0)),
                 "technical_count": int(layer_counts.get("技术突破候选", 0)),
                 "near_count": int(layer_counts.get("接近候选", 0)),
@@ -465,6 +532,8 @@ def _append_observation_log(
                 "near_mainline_count": int(mainline_counts.get("接近确认", 0)),
                 "confirmed_mainline_count": int(mainline_counts.get("确认主线", 0)),
                 "downtrend_mainline_count": int(mainline_counts.get("退潮观察", 0)),
+                "entry_channel_distribution": _format_count_distribution(entry_channel_counts or {}),
+                "candidate_grade_distribution": _format_count_distribution(candidate_grade_counts or {}),
                 "has_trade_plan": int(has_trade_plan),
                 "reasons": "；".join(reasons),
                 "markdown_path": str(markdown_path),
@@ -473,6 +542,12 @@ def _append_observation_log(
                 "error": "",
             }
         )
+
+
+def _format_count_distribution(counts: dict[str, int]) -> str:
+    if not counts:
+        return "无"
+    return "；".join(f"{key}:{value}" for key, value in counts.items() if key)
 
 
 def _format_observation_output(observation: dict[str, object]) -> str:
@@ -486,6 +561,7 @@ def _format_observation_output(observation: dict[str, object]) -> str:
             f"预警个股池数量：{observation['warning_pool_count']}",
             f"重点观察个股池数量：{observation['focus_pool_count']}",
             f"正式候选股池数量：{observation['formal_count']}",
+            f"小仓试错候选数量：{observation['trial_count']}",
             f"技术突破候选数量：{observation['technical_count']}",
             f"接近候选数量：{observation['near_count']}",
             f"主线预警行业数量：{observation['watch_mainline_count']}",

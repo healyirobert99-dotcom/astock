@@ -36,6 +36,8 @@ def test_sample_strategy_run_writes_required_outputs(tmp_path: Path) -> None:
         strategy_columns = {row["name"] for row in conn.execute("PRAGMA table_info(strategy_result)").fetchall()}
         for column in {
             "candidate_layer",
+            "entry_channel",
+            "candidate_grade",
             "mainline_status",
             "mainline_base_score",
             "keypoint_distance_pct",
@@ -138,6 +140,8 @@ def test_observe_exports_daily_markdown_and_csv(tmp_path: Path) -> None:
     assert "## 三、筛选漏斗" in markdown
     header = candidates_path.read_text(encoding="utf-8-sig").splitlines()[0]
     assert "code,name,industry,status,candidate_layer" in header
+    assert "entry_channel" in header
+    assert "candidate_grade" in header
 
 
 def test_sample_provider_includes_core_indices() -> None:
@@ -710,6 +714,33 @@ def test_80_confirmed_mainline_generates_formal_stock_pool() -> None:
     assert row["suggested_position"] > 0
 
 
+def test_near_confirm_channel_generates_small_trial_candidate() -> None:
+    data, industry_scores, market = _layered_select_input("接近确认", 76, breakout=True)
+    row = select_stocks(data, "2025-09-27", market, industry_scores, StrategyConfig()).iloc[0]
+    assert row["entry_channel"] == "接近确认通道"
+    assert row["candidate_grade"] == "B：接近确认小仓候选"
+    assert row["candidate_layer"] == "小仓试错候选"
+    assert row["suggested_action"] == "建议小仓试错"
+    assert 5 <= float(row["suggested_position"]) <= 8
+    for field in ("buy_lower", "buy_upper", "suggested_buy_price", "stop_loss_price", "take_profit_1", "take_profit_2"):
+        assert row[field] is not None
+    assert "主线标准" in row["risk_warning"]
+
+
+def test_strong_trend_channel_generates_small_trial_candidate() -> None:
+    data, industry_scores, market = _layered_select_input("主线预警", 66, breakout=True)
+    row = select_stocks(data, "2025-09-27", market, industry_scores, StrategyConfig()).iloc[0]
+    assert row["entry_channel"] == "强趋势试错通道"
+    assert row["candidate_grade"] == "C：强趋势试错候选"
+    assert row["candidate_layer"] == "小仓试错候选"
+    assert row["suggested_action"] == "强趋势试错"
+    assert 3 <= float(row["suggested_position"]) <= 5
+    assert row["buy_lower"] is not None
+    assert row["buy_upper"] is not None
+    assert row["stop_loss_price"] is not None
+    assert "主线尚未强确认" in row["risk_warning"]
+
+
 def test_market_below_65_downgrades_confirmed_breakout_from_formal_pool() -> None:
     data, industry_scores, market = _layered_select_input("确认主线", 85, breakout=True, market_score=57)
     results = select_stocks(data, "2025-09-27", market, industry_scores, StrategyConfig())
@@ -719,6 +750,18 @@ def test_market_below_65_downgrades_confirmed_breakout_from_formal_pool() -> Non
     assert row["buy_lower"] is None
     assert row["buy_upper"] is None
     assert row["suggested_buy_price"] is None
+    assert row["entry_channel"] == "观察通道"
+    assert row["candidate_grade"] == "观察"
+
+
+def test_c_fundamental_cannot_enter_small_trial_candidate() -> None:
+    data, industry_scores, market = _layered_select_input("接近确认", 76, breakout=True)
+    data["financials"].loc[:, "net_profit_missing"] = 1
+    row = select_stocks(data, "2025-09-27", market, industry_scores, StrategyConfig()).iloc[0]
+    assert row["candidate_layer"] != "小仓试错候选"
+    assert row["candidate_layer"] != "正式候选股池"
+    assert row["suggested_position"] == 0
+    assert "财务数据缺失" in row["risk_warning"] or "仅观察" in row["risk_warning"]
 
 
 def test_layer_priority_uses_highest_matching_pool() -> None:
@@ -728,7 +771,9 @@ def test_layer_priority_uses_highest_matching_pool() -> None:
 
     data, industry_scores, market = _layered_select_input("接近确认", 76, breakout=True)
     row = select_stocks(data, "2025-09-27", market, industry_scores, StrategyConfig()).iloc[0]
-    assert row["candidate_layer"] == "重点观察个股池"
+    assert row["candidate_layer"] == "小仓试错候选"
+    assert row["entry_channel"] == "接近确认通道"
+    assert row["candidate_grade"] == "B：接近确认小仓候选"
 
 
 def _assert_trade_plan_legality(plan: dict) -> None:

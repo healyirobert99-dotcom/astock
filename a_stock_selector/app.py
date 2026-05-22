@@ -16,6 +16,8 @@ CANDIDATE_EXPORT_COLUMNS = [
     "industry",
     "status",
     "candidate_layer",
+    "entry_channel",
+    "candidate_grade",
     "mainline_status",
     "mainline_base_score",
     "signal_status",
@@ -1508,7 +1510,7 @@ def _attach_mainline_stock_pool_counts(conn, batch_id: str, industry: pd.DataFra
         SELECT industry, candidate_layer, COUNT(*) AS cnt
         FROM strategy_result
         WHERE batch_id = ?
-          AND candidate_layer IN ('预警个股池', '重点观察个股池', '正式候选股池')
+          AND candidate_layer IN ('预警个股池', '重点观察个股池', '正式候选股池', '小仓试错候选')
         GROUP BY industry, candidate_layer
         """,
         (batch_id,),
@@ -1648,7 +1650,8 @@ def render_candidates(st, conn) -> None:
     results = read_sql(
         conn,
         """
-        SELECT code, name, industry, status, candidate_layer, mainline_status, mainline_base_score,
+        SELECT code, name, industry, status, candidate_layer, entry_channel, candidate_grade,
+               mainline_status, mainline_base_score,
                keypoint_distance_pct, signal_status, market_score, industry_score,
                fundamental_status, trend_template_type, volume_quality, close_quality,
                risk_level, keypoint_date, keypoint_price, keypoint_type,
@@ -1685,7 +1688,7 @@ def render_candidates(st, conn) -> None:
 
         # Candidate table
         display_cols = [
-            "code", "name", "industry", "trend_template_type",
+            "code", "name", "industry", "candidate_layer", "entry_channel", "candidate_grade", "trend_template_type",
             "keypoint_type", "keypoint_price", "trade_plan_type", "suggested_action",
             "buy_lower", "buy_upper", "suggested_buy_price",
             "stop_loss_price", "take_profit_1", "take_profit_2",
@@ -1712,7 +1715,7 @@ def render_candidates(st, conn) -> None:
             st.markdown('<div class="panel-title">完整交易计划明细</div>', unsafe_allow_html=True)
             with st.container(border=True):
                 detail_cols = [
-                    "code", "name", "signal_status", "trend_template_type",
+                    "code", "name", "signal_status", "candidate_layer", "entry_channel", "candidate_grade", "trend_template_type",
                     "keypoint_date", "keypoint_price", "keypoint_type",
                     "volume_quality", "close_quality", "trade_plan_type",
                     "watch_price", "trigger_price", "buy_lower", "buy_upper",
@@ -1739,7 +1742,8 @@ def _render_layered_candidates(st, conn, batch_id: str) -> None:
     layered = read_sql(
         conn,
         """
-        SELECT code, name, industry, candidate_layer, mainline_status, mainline_base_score,
+        SELECT code, name, industry, candidate_layer, entry_channel, candidate_grade,
+               mainline_status, mainline_base_score,
                signal_status, market_score, industry_score, fundamental_status, trend_template_type,
                keypoint_type, keypoint_price, keypoint_distance_pct,
                volume_quality, close_quality, suggested_action, watch_price, trigger_price,
@@ -1747,13 +1751,14 @@ def _render_layered_candidates(st, conn, batch_id: str) -> None:
                suggested_position, risk_warning, rejected_reason_detail, exclude_reason
         FROM strategy_result
         WHERE batch_id = ?
-          AND candidate_layer IN ('预警个股池', '重点观察个股池', '正式候选股池', '技术突破候选', '接近候选')
+          AND candidate_layer IN ('预警个股池', '重点观察个股池', '正式候选股池', '小仓试错候选', '技术突破候选', '接近候选')
         ORDER BY CASE candidate_layer
                     WHEN '正式候选股池' THEN 1
-                    WHEN '重点观察个股池' THEN 2
-                    WHEN '预警个股池' THEN 3
-                    WHEN '技术突破候选' THEN 4
-                    WHEN '接近候选' THEN 5
+                    WHEN '小仓试错候选' THEN 2
+                    WHEN '重点观察个股池' THEN 3
+                    WHEN '预警个股池' THEN 4
+                    WHEN '技术突破候选' THEN 5
+                    WHEN '接近候选' THEN 6
                     ELSE 9
                  END,
                  industry_score DESC,
@@ -1803,6 +1808,8 @@ def _render_layered_candidates(st, conn, batch_id: str) -> None:
                 "name": "名称",
                 "industry": "行业",
                 "candidate_layer": "候选层级",
+                "entry_channel": "入选通道",
+                "candidate_grade": "候选等级",
                 "mainline_status": "主线状态",
                 "mainline_base_score": "主线基础分",
                 "signal_status": "信号状态",
@@ -2007,7 +2014,7 @@ def _candidate_layer_counts(conn, batch_id: str) -> dict[str, int]:
         (batch_id,),
     ).fetchall()
     counts = {str(row["candidate_layer"]): int(row["cnt"]) for row in rows}
-    for layer in ("预警个股池", "重点观察个股池", "正式候选股池", "技术突破候选", "接近候选", "剔除"):
+    for layer in ("预警个股池", "重点观察个股池", "正式候选股池", "小仓试错候选", "技术突破候选", "接近候选", "剔除"):
         counts.setdefault(layer, 0)
     return counts
 
