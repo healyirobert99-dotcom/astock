@@ -384,12 +384,18 @@ class AKShareDataProvider:
     def _fetch_spot_daily(self, stock_basic: pd.DataFrame, latest_trade_date: str) -> pd.DataFrame:
         import akshare as ak
 
+        tencent_daily = self._fetch_tencent_quote_daily(stock_basic, latest_trade_date)
+        min_coverage = max(1, int(len(stock_basic) * 0.80))
+        if len(tencent_daily) >= min_coverage:
+            return tencent_daily
+
         candidates: list[tuple[str, pd.DataFrame]] = []
+        if not tencent_daily.empty:
+            candidates.append(("腾讯", tencent_daily))
         providers = [
             ("新浪", ak.stock_zh_a_spot),
             ("东方财富", ak.stock_zh_a_spot_em),
         ]
-        min_coverage = max(1, int(len(stock_basic) * 0.80))
         for label, provider in providers:
             self._emit(f"免费源读取{label}全市场行情", 10, 100)
             try:
@@ -406,6 +412,64 @@ class AKShareDataProvider:
             return _empty_stock_daily_frame()
         label, daily = max(candidates, key=lambda item: len(item[1]))
         self._emit(f"{label}全市场行情覆盖不足：{len(daily)} 条", 64, 100)
+        return daily
+
+    def _fetch_tencent_quote_daily(self, stock_basic: pd.DataFrame, latest_trade_date: str) -> pd.DataFrame:
+        import requests
+
+        codes = stock_basic["code"].astype(str).str.zfill(6).tolist()
+        if not codes:
+            return _empty_stock_daily_frame()
+        rows = []
+        total = len(codes)
+        trade_date = latest_trade_date or date.today().strftime("%Y-%m-%d")
+        for idx, chunk in enumerate(_chunks(codes, 300), start=1):
+            start = (idx - 1) * 300 + 1
+            self._emit(f"免费源读取腾讯批量行情：{min(start, total)}/{total}", 10 + int(start / max(total, 1) * 50), 100)
+            symbols = ",".join(_tencent_quote_symbol(code) for code in chunk)
+            try:
+                response = requests.get(f"http://qt.gtimg.cn/q={symbols}", timeout=20)
+                response.encoding = "gbk"
+            except Exception:
+                continue
+            for item in response.text.split(";"):
+                if '="' not in item:
+                    continue
+                payload = item.split('="', 1)[1].strip().strip('"')
+                parts = payload.split("~")
+                if len(parts) < 38:
+                    continue
+                code = str(parts[2]).zfill(6)
+                close = _to_float(parts[3])
+                open_price = _to_float(parts[5])
+                high = _to_float(parts[33])
+                low = _to_float(parts[34])
+                pct_chg = _to_float(parts[32])
+                volume = _to_float(parts[36]) * 100
+                amount = _to_float(parts[37]) * 10000
+                if close <= 0 or high <= 0 or low <= 0:
+                    continue
+                rows.append(
+                    {
+                        "code": code,
+                        "trade_date": trade_date,
+                        "open": open_price,
+                        "high": high,
+                        "low": low,
+                        "close": close,
+                        "volume": volume,
+                        "amount": amount,
+                        "pct_chg": pct_chg,
+                        "turnover_rate": 0.0,
+                    }
+                )
+        if not rows:
+            return _empty_stock_daily_frame()
+        daily = pd.DataFrame(rows).drop_duplicates(["code", "trade_date"], keep="last")
+        daily["is_suspended"] = 0
+        daily["is_limit_up"] = daily["pct_chg"].ge(9.5).astype(int)
+        daily["is_limit_down"] = daily["pct_chg"].le(-9.5).astype(int)
+        self._emit(f"腾讯批量行情完成：{len(daily)} 条", 64, 100)
         return daily
 
     def _normalize_spot_frame(
@@ -1327,13 +1391,14 @@ def _normalize_tencent_index_hist(
     end = pd.to_datetime(end_date).strftime("%Y-%m-%d")
     frame = frame[(frame["trade_date"] >= start) & (frame["trade_date"] <= end)].copy()
     if frame.empty:
-        return pd.DataFrame(columns=["index_code", "index_name", "trade_date", "open", "high", "low", "close", "amount"])
+        return pd.DataFrame(columns=["index_code", "index_name", "trade_date", "open", "high", "low", "close", "volume", "amount"])
     for column in ["open", "high", "low", "close", "amount"]:
         frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
     frame["index_code"] = index_code
     frame["index_name"] = index_name
     frame["amount"] = frame["amount"] * 100
-    return frame[["index_code", "index_name", "trade_date", "open", "high", "low", "close", "amount"]]
+    frame["volume"] = (frame["amount"] / frame["close"].replace(0, pd.NA)).fillna(0.0)
+    return frame[["index_code", "index_name", "trade_date", "open", "high", "low", "close", "volume", "amount"]]
 
 
 def _tencent_stock_symbol(code: str) -> str:
@@ -1341,6 +1406,15 @@ def _tencent_stock_symbol(code: str) -> str:
     if code.startswith(("6", "9")):
         return f"sh{code}"
     return f"sz{code}"
+
+
+def _tencent_quote_symbol(code: str) -> str:
+    code = str(code).zfill(6)
+    if code.startswith("6"):
+        return f"sh{code}"
+    if code.startswith(("0", "2", "3")):
+        return f"sz{code}"
+    return f"bj{code}"
 
 
 def _latest_trade_date_from_db_or_dataset(conn, dataset: MarketDataset) -> str:
