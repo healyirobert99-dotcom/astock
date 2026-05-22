@@ -324,8 +324,14 @@ class AKShareDataProvider:
         import akshare as ak
 
         spot_daily = self._fetch_spot_daily(stock_basic, latest_trade_date)
-        if len(spot_daily) >= max(1, int(len(stock_basic) * 0.80)):
+        min_coverage = max(1, int(len(stock_basic) * 0.80))
+        if len(spot_daily) >= min_coverage:
             return spot_daily
+        if len(stock_basic) > 500:
+            raise RuntimeError(
+                f"免费全市场快照覆盖不足：{len(spot_daily)}/{len(stock_basic)}。"
+                "已停止逐股拉取以避免长时间卡住，请稍后重试或检查网络后重新刷新。"
+            )
 
         rows = []
         total = len(stock_basic)
@@ -378,17 +384,36 @@ class AKShareDataProvider:
     def _fetch_spot_daily(self, stock_basic: pd.DataFrame, latest_trade_date: str) -> pd.DataFrame:
         import akshare as ak
 
-        self._emit("免费源读取新浪全市场行情", 10, 100)
-        try:
-            spot = _akshare_call_with_retries(ak.stock_zh_a_spot, retries=2, delay_seconds=1.0)
-        except Exception:
-            spot = pd.DataFrame()
-        if spot.empty:
+        candidates: list[tuple[str, pd.DataFrame]] = []
+        providers = [
+            ("新浪", ak.stock_zh_a_spot),
+            ("东方财富", ak.stock_zh_a_spot_em),
+        ]
+        min_coverage = max(1, int(len(stock_basic) * 0.80))
+        for label, provider in providers:
+            self._emit(f"免费源读取{label}全市场行情", 10, 100)
             try:
-                self._emit("新浪行情不可用，切换东方财富全市场行情", 10, 100)
-                spot = _akshare_call_with_retries(ak.stock_zh_a_spot_em, retries=2, delay_seconds=1.0)
+                spot = _akshare_call_with_retries(provider, retries=2, delay_seconds=1.0)
             except Exception:
-                spot = pd.DataFrame()
+                continue
+            daily = self._normalize_spot_frame(spot, stock_basic, latest_trade_date)
+            if not daily.empty:
+                candidates.append((label, daily))
+            if len(daily) >= min_coverage:
+                self._emit(f"{label}全市场行情完成：{len(daily)} 条", 64, 100)
+                return daily
+        if not candidates:
+            return _empty_stock_daily_frame()
+        label, daily = max(candidates, key=lambda item: len(item[1]))
+        self._emit(f"{label}全市场行情覆盖不足：{len(daily)} 条", 64, 100)
+        return daily
+
+    def _normalize_spot_frame(
+        self,
+        spot: pd.DataFrame,
+        stock_basic: pd.DataFrame,
+        latest_trade_date: str,
+    ) -> pd.DataFrame:
         if spot.empty or not {"代码", "最新价", "今开", "最高", "最低", "成交量", "成交额", "涨跌幅"}.issubset(set(spot.columns)):
             return _empty_stock_daily_frame()
         frame = spot.copy()
@@ -416,7 +441,6 @@ class AKShareDataProvider:
         daily["is_suspended"] = 0
         daily["is_limit_up"] = daily["pct_chg"].ge(9.5).astype(int)
         daily["is_limit_down"] = daily["pct_chg"].le(-9.5).astype(int)
-        self._emit(f"新浪全市场行情完成：{len(daily)} 条", 64, 100)
         return daily
 
     def _fetch_index_daily(self, start_date: str, end_date: str) -> pd.DataFrame:
